@@ -1,0 +1,3 @@
+"""
+factor-pricing source package.
+"""
