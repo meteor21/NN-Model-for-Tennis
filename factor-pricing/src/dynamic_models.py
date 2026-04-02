@@ -54,12 +54,14 @@ class RollingFactorForecaster:
         model_type: str = "ridge",
         lags: Optional[list] = None,
         min_obs_frac: float = 0.8,
+        step: int = 1,
     ):
         self.window        = window
         self.n_factors     = n_factors
         self.model_type    = model_type
         self.lags          = lags if lags is not None else [1, 5]
         self.min_obs_frac  = min_obs_frac
+        self.step          = max(1, step)  # refit every `step` days
 
         self._predictions: Optional[pd.Series] = None
         self._actuals:     Optional[pd.Series] = None
@@ -107,6 +109,14 @@ class RollingFactorForecaster:
             n, self.window, self.n_factors, self.model_type,
         )
 
+        current_model = None
+        current_scaler = None
+        current_feat_scaler = None
+        current_k = None
+        current_pca = None
+        current_F_win_df = None
+        current_macro_win = None
+
         for i in range(self.window + max_lag, n):
             win_ret  = R.iloc[i - self.window: i]
             win_ret  = win_ret.dropna()
@@ -114,69 +124,83 @@ class RollingFactorForecaster:
             if len(win_ret) < min_obs:
                 continue
 
-            # ── 1. Fit PCA on window ──────────────────────────────────────
-            scaler = StandardScaler()
-            X_win  = scaler.fit_transform(win_ret.values)
-            k      = min(self.n_factors, X_win.shape[1])
-            pca    = PCA(n_components=k)
-            F_win  = pca.fit_transform(X_win)                   # window × k
-            F_win_df = pd.DataFrame(F_win, index=win_ret.index,
-                                    columns=[f"F{j+1}" for j in range(k)])
+            # Only refit model every `step` days
+            refit = (i - self.window - max_lag) % self.step == 0
 
-            # ── 2. Build in-window lagged features & target ───────────────
-            macro_win = M.loc[win_ret.index]
-            feature_rows = []
-            y_rows       = []
+            if refit:
+                # ── 1. Fit PCA on window ──────────────────────────────────
+                current_scaler = StandardScaler()
+                X_win  = current_scaler.fit_transform(win_ret.values)
+                current_k  = min(self.n_factors, X_win.shape[1])
+                current_pca = PCA(n_components=current_k)
+                F_win  = current_pca.fit_transform(X_win)
+                current_F_win_df = pd.DataFrame(
+                    F_win, index=win_ret.index,
+                    columns=[f"F{j+1}" for j in range(current_k)]
+                )
+                current_macro_win = M.loc[win_ret.index]
 
-            for t_idx in range(max_lag, len(win_ret)):
-                row = []
-                for lag in self.lags:
-                    if t_idx - lag >= 0:
-                        row.extend(F_win_df.iloc[t_idx - lag].values.tolist())
-                        row.extend(macro_win.iloc[t_idx - lag].values.tolist())
-                    else:
-                        row.extend([np.nan] * (k + M.shape[1]))
-                feature_rows.append(row)
-                y_rows.append(ew_ret.iloc[i - self.window + t_idx])
+                # ── 2. Build in-window lagged features & target ───────────
+                feature_rows = []
+                y_rows       = []
+                for t_idx in range(max_lag, len(win_ret)):
+                    row = []
+                    for lag in self.lags:
+                        if t_idx - lag >= 0:
+                            row.extend(current_F_win_df.iloc[t_idx - lag].values.tolist())
+                            row.extend(current_macro_win.iloc[t_idx - lag].values.tolist())
+                        else:
+                            row.extend([np.nan] * (current_k + M.shape[1]))
+                    feature_rows.append(row)
+                    y_rows.append(ew_ret.iloc[i - self.window + t_idx])
 
-            Xw = np.array(feature_rows, dtype=float)
-            yw = np.array(y_rows, dtype=float)
+                Xw = np.array(feature_rows, dtype=float)
+                yw = np.array(y_rows, dtype=float)
+                valid = np.isfinite(Xw).all(axis=1) & np.isfinite(yw)
+                Xw, yw = Xw[valid], yw[valid]
 
-            valid = np.isfinite(Xw).all(axis=1) & np.isfinite(yw)
-            Xw, yw = Xw[valid], yw[valid]
-            if len(yw) < 20:
+                if len(yw) < 20:
+                    current_model = None
+                    continue
+
+                # ── 3. Fit regression model ───────────────────────────────
+                current_feat_scaler = StandardScaler()
+                Xw_s = current_feat_scaler.fit_transform(Xw)
+
+                if self.model_type == "ridge":
+                    alphas = np.logspace(-4, 4, 20)
+                    tscv   = TimeSeriesSplit(n_splits=min(3, len(yw) // 10 + 1))
+                    current_model = RidgeCV(alphas=alphas, cv=tscv)
+                else:
+                    from sklearn.linear_model import LinearRegression
+                    current_model = LinearRegression()
+
+                current_model.fit(Xw_s, yw)
+
+            if current_model is None or current_F_win_df is None:
                 continue
 
-            # ── 3. Fit regression model ───────────────────────────────────
-            feat_scaler = StandardScaler()
-            Xw_s = feat_scaler.fit_transform(Xw)
-
-            if self.model_type == "ridge":
-                alphas = np.logspace(-4, 4, 30)
-                tscv   = TimeSeriesSplit(n_splits=min(5, len(yw) // 10 + 1))
-                model  = RidgeCV(alphas=alphas, cv=tscv)
-            else:
-                from sklearn.linear_model import LinearRegression
-                model = LinearRegression()
-
-            model.fit(Xw_s, yw)
-
             # ── 4. Build prediction feature vector for date i ─────────────
+            # Project current observation onto the last-fitted PCA
+            x_curr  = current_scaler.transform(R.iloc[[i]].values)
+            f_curr  = current_pca.transform(x_curr)[0]
+            m_curr  = M.iloc[i].values
+
             pred_row = []
             for lag in self.lags:
-                lag_idx = len(F_win_df) - lag
+                lag_idx = len(current_F_win_df) - lag
                 if lag_idx >= 0:
-                    pred_row.extend(F_win_df.iloc[lag_idx].values.tolist())
-                    pred_row.extend(macro_win.iloc[lag_idx].values.tolist())
+                    pred_row.extend(current_F_win_df.iloc[lag_idx].values.tolist())
+                    pred_row.extend(current_macro_win.iloc[lag_idx].values.tolist())
                 else:
-                    pred_row.extend([0.0] * (k + M.shape[1]))
+                    pred_row.extend([0.0] * (current_k + M.shape[1]))
 
             pred_arr = np.array(pred_row, dtype=float).reshape(1, -1)
             if not np.isfinite(pred_arr).all():
                 continue
 
-            pred_arr_s = feat_scaler.transform(pred_arr)
-            preds_dict[dates[i]] = float(model.predict(pred_arr_s)[0])
+            pred_arr_s = current_feat_scaler.transform(pred_arr)
+            preds_dict[dates[i]] = float(current_model.predict(pred_arr_s)[0])
 
         predictions = pd.Series(preds_dict, name="predicted")
         predictions.index = pd.to_datetime(predictions.index)
