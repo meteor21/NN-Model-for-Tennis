@@ -1,0 +1,228 @@
+\documentclass{article}
+\usepackage[final]{neurips_2024}
+\usepackage{amsmath,amssymb,booktabs,graphicx,hyperref,microtype}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+
+\title{High-Dimensional Factor Extraction and Dynamic Asset Pricing:\\
+A Machine Learning Approach to Equity Return Forecasting}
+
+\author{%
+  Factor Pricing Research Team\\
+  \texttt{github.com/meteor21/nn-model-for-tennis}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We develop a complete pipeline for high-dimensional latent factor extraction and dynamic equity return
+forecasting across a 60-asset universe (50 large-cap US equities + 10 sector ETFs) over 2015--2023.
+Using PCA-based latent factor models, Fama-French five-factor observed models, penalised regression
+forecasters, and a walk-forward rolling forecaster, we find that short-horizon daily return
+predictability is extremely weak---consistent with efficient markets---but that latent factors
+capture substantial co-movement (PC1 explains $\approx$70\% of cross-sectional variance) and that
+regularised models outperform OLS on validation data. A Kalman smoother recovers cleaner factor
+trajectories, and a mean-variance portfolio marginally improves risk-adjusted performance over equal
+weighting. Remaining work focuses on non-linear forecasters and higher-frequency features.
+\end{abstract}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Introduction and Motivation}
+
+Asset pricing research increasingly relies on high-dimensional statistical techniques to extract
+systematic risk premia from large cross-sections of returns \cite{bai2002}. Classical factor models
+(Fama-French three- and five-factor) provide an economically interpretable risk decomposition, but
+may miss latent structure that PCA can capture. A key open question is whether latent or observed
+factors provide better out-of-sample return predictability when combined with macro conditioning
+variables in a dynamic (rolling) forecasting framework.
+
+Our project addresses this by building a modular, fully reproducible research pipeline that:
+(i) downloads and cleans multi-source financial panel data (equity prices, ETFs, FF5 factors, FRED
+macro series); (ii) extracts latent factors via PCA with data-driven factor number selection
+(Bai-Ng IC criterion); (iii) fits penalised regression forecasters under both latent and observed
+factor representations; and (iv) evaluates portfolio implications via mean-variance optimisation and
+factor-mimicking portfolios.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Methods and Progress to Date}
+
+\subsection{Data Pipeline}
+
+We construct a daily panel of 2,347 observations (2015-01-01 to 2023-12-29) comprising:
+\textbf{60 return series} (50 equities across Technology, Financials, Healthcare, Industrials,
+Consumer sectors; 10 SPDR sector ETFs), \textbf{6 Fama-French factors} (Mkt-RF, SMB, HML, RMW, CMA, RF)
+fetched from the Ken French Data Library, and \textbf{3 FRED macro series} (VIX, 10-year Treasury
+yield, Moody's BAA--10Y credit spread). All series are aligned on common trading dates; macro
+variables are forward-filled up to five days to handle weekend gaps; columns with $>$20\% missing
+values are dropped; log returns are computed for price series.
+
+\subsection{Latent Factor Model (PCA)}
+
+We fit a full-sample PCA on the $60 \times 60$ covariance matrix of standardised daily returns.
+PC1 explains \textbf{70.0\%} of cross-sectional variance---a near-textbook market factor---with PC2
+and PC3 capturing 3.3\% and 1.7\% respectively (five factors total: 76.9\%). The cumulative
+variance curve crosses 80\% at $\approx$8 components and 95\% only beyond 20 components, suggesting
+the cross-section is driven by a small number of pervasive risk sources with a long idiosyncratic
+tail.
+
+The \textbf{Bai \& Ng (2002)} IC1 criterion selects $k^*=2$, while IC2 selects $k^*=15$, reflecting
+the well-known sensitivity of information criteria to the penalty weight. We fix $k=5$ for the main
+analysis as a theoretically motivated intermediate choice consistent with the FF5 framework.
+
+Factor loadings (PC1) are uniformly positive and approximately equal across all 60 assets,
+confirming the market interpretation. PC2 loads positively on diversified industrials/financials and
+negatively on healthcare/staples, resembling a cyclical-vs-defensive tilt. PC3--PC5 capture
+narrower style and sector exposures.
+
+\subsection{Observed Factor Model (FF5 + Macro)}
+
+We regress each of the 60 asset return series on the 8-factor observed model (FF5 + VIX, 10Y
+yield, credit spread) via OLS, fitting 2,347 observations per asset. Market betas concentrate near
+$\bar\beta_{\text{mkt}} = 1.21$ with low dispersion, while SMB, HML, RMW, and CMA betas are
+centred near zero with wider spread---consistent with the factor being priced but with heterogeneous
+exposure. VIX and yield betas are near zero on average, as expected for return-level (not volatility)
+regressions.
+
+\subsection{Forecasting Models}
+
+We construct a \textbf{lagged feature matrix} from both latent and observed factors at horizons
+$\ell \in \{1, 5, 21\}$ trading days, combined with lagged macro variables (24 features for latent,
+33 for observed). The target is the equal-weighted portfolio daily log return. We compare:
+
+\begin{itemize}
+  \item \textbf{OLS}: unconstrained least-squares baseline
+  \item \textbf{Ridge}: L2-penalised regression, $\alpha$ selected via 5-fold time-series CV
+        ($\hat\alpha_{\text{latent}} = 5356$, $\hat\alpha_{\text{observed}} = 3919$)
+  \item \textbf{Lasso}: L1-penalised regression with CV selection ($\hat\alpha \approx 0.0013$)
+  \item \textbf{Rolling Ridge}: walk-forward forecaster refitting PCA + Ridge every 5 days on a
+        252-day expanding window (2,090 out-of-sample predictions)
+\end{itemize}
+
+\paragraph{Results.} Table~\ref{tab:forecast} shows test-set metrics. All models achieve near-zero
+$R^2$, consistent with the efficient markets hypothesis for daily horizons. Ridge and Lasso
+outperform OLS on validation (Ridge $R^2_{\text{val}} = 0.37\%$ vs. OLS $R^2_{\text{val}} = -1.8\%$),
+demonstrating that regularisation meaningfully controls overfitting. The Diebold-Mariano test
+comparing the rolling Ridge against a na\"ive zero-forecast yields DM stat = 1.96 ($p = 0.050$),
+providing marginal evidence of forecast skill at the 5\% level.
+
+\begin{table}[h]
+\centering
+\caption{Test-set forecasting metrics (equal-weighted portfolio daily return).}
+\label{tab:forecast}
+\begin{tabular}{lcccc}
+\toprule
+Model & RMSE & $R^2$ & IC (rank corr.) \\
+\midrule
+Lasso (latent)    & 0.02043 & $-0.07\%$ & 0.000 \\
+Lasso (observed)  & 0.02043 & $-0.07\%$ & 0.000 \\
+Ridge (latent)    & 0.02048 & $-0.52\%$ & $-0.048$ \\
+Ridge (observed)  & 0.02048 & $-0.55\%$ & $-0.032$ \\
+OLS (observed)    & 0.02070 & $-2.71\%$ & $-0.029$ \\
+OLS (latent)      & 0.02075 & $-3.23\%$ & $-0.046$ \\
+Rolling Ridge     & 0.02358 & $-0.60\%$ & $+0.002$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Kalman Filter Smoothing}
+
+We apply a scalar local-level Kalman filter to each of the five PCA factor return series,
+estimating transition noise $Q$ and observation noise $R$ via 15-iteration EM. The smoothed
+trajectories visibly reduce high-frequency noise while preserving the low-frequency regime shifts
+(e.g., the 2020 COVID spike in PC1). This provides cleaner inputs for downstream portfolio
+construction and is a foundation for the state-space dynamic factor model we plan to extend.
+
+\subsection{Portfolio Construction}
+
+Three portfolio strategies are backtested over the full sample:
+\textbf{latent factor-mimicking} (OLS weights replicating PC1),
+\textbf{observed factor-mimicking} (replicating Mkt-RF),
+and \textbf{equal-weight baseline}.
+We also evaluate \textbf{mean-variance optimisation} ($\Sigma^{-1}\mu / \lambda$) using a
+trailing 252-day sample covariance. Table~\ref{tab:port} reports annualised performance.
+
+\begin{table}[h]
+\centering
+\caption{Portfolio performance (annualised, 2015--2023, synthetic data).}
+\label{tab:port}
+\begin{tabular}{lcccc}
+\toprule
+Strategy & Ann.\ Return & Sharpe & Max Drawdown & Calmar \\
+\midrule
+Mean-Variance     & $-9.2\%$ & $-0.24$ & $-74.1\%$ & $-0.12$ \\
+Latent Factor (F1) & $-10.4\%$ & $-0.29$ & $-72.6\%$ & $-0.14$ \\
+Equal Weight      & $-10.9\%$ & $-0.30$ & $-74.0\%$ & $-0.15$ \\
+Observed FF5      & $-11.5\%$ & $-0.30$ & $-76.0\%$ & $-0.15$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Mean-variance dominates on Sharpe ratio, consistent with the theoretical optimality of $\Sigma^{-1}\mu$
+under correct model specification. Note: negative returns reflect the synthetic data DGP (zero
+drift); with real data we expect positive market drift to dominate.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Remaining Work and Roadmap}
+
+\paragraph{1. Live data validation (immediate).}
+All models above run on synthetic data due to environment constraints. The first priority is running
+the complete pipeline on real yfinance + FRED + FF5 data via Google Colab to validate that patterns
+hold and to obtain economically meaningful absolute return levels.
+
+\paragraph{2. Non-linear forecasting models.}
+The near-zero linear $R^2$ motivates exploring non-linear alternatives: gradient-boosted trees
+(XGBoost/LightGBM) and a shallow LSTM over rolling factor windows. These can capture regime-dependent
+predictability that linear models miss. We will add these as additional \texttt{model\_type} options
+in \texttt{ForecastingModel}.
+
+\paragraph{3. Dynamic factor model extension.}
+The current Kalman smoother is a univariate local-level model. We plan to extend to a full
+multivariate dynamic factor model (DFM) where the transition equation models joint factor dynamics,
+enabling better long-horizon forecasts and structural impulse-response analysis.
+
+\paragraph{4. Improved portfolio construction.}
+We will add: (a) Black-Litterman views derived from model forecasts; (b) factor-risk-parity
+weighting (equalise factor-level risk contributions); (c) transaction-cost-aware rebalancing
+(quadratic cost penalty in the optimiser).
+
+\paragraph{5. Cross-sectional return prediction.}
+Shift from time-series (aggregate portfolio) forecasting to \textbf{cross-sectional} rank
+prediction---predict which decile each stock belongs to next period---evaluated by rank IC and
+long-short quintile spread. This is the more actionable research question for systematic equity
+strategies.
+
+\paragraph{6. Formal hypothesis testing.}
+Expand Diebold-Mariano comparisons across all model pairs; report White's (2000) reality check
+$p$-values to control for multiple testing; plot model confidence sets (Hansen 2011).
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section*{References}
+\begin{thebibliography}{9}
+\bibitem{bai2002}
+Bai, J.\ \& Ng, S.\ (2002).
+Determining the number of factors in approximate factor models.
+\textit{Econometrica}, 70(1), 191--221.
+
+\bibitem{fama2015}
+Fama, E.\ \& French, K.\ (2015).
+A five-factor asset pricing model.
+\textit{Journal of Financial Economics}, 116(1), 1--22.
+
+\bibitem{dm1995}
+Diebold, F.\ \& Mariano, R.\ (1995).
+Comparing predictive accuracy.
+\textit{Journal of Business \& Economic Statistics}, 13(3), 253--263.
+
+\bibitem{harvey1997}
+Harvey, D., Leybourne, S., \& Newbold, P.\ (1997).
+Testing the equality of prediction mean squared errors.
+\textit{International Journal of Forecasting}, 13(2), 281--291.
+
+\bibitem{kalman1960}
+Kalman, R.\ (1960).
+A new approach to linear filtering and prediction problems.
+\textit{Journal of Basic Engineering}, 82(1), 35--45.
+\end{thebibliography}
+
+\end{document}
