@@ -112,6 +112,16 @@ def parse_args() -> argparse.Namespace:
         default=config.DATA_DIR,
         help="Directory for raw and processed data (default: data/).",
     )
+    parser.add_argument(
+        "--fred_key",
+        type=str,
+        default=None,
+        help=(
+            "FRED API key for direct REST access. "
+            "Can also be set via the FRED_API_KEY environment variable. "
+            "Get a free key at https://fred.stlouisfed.org/docs/api/api_key.html"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -153,6 +163,10 @@ def step_data(args: argparse.Namespace) -> pd.DataFrame:
 
     logger.info("[1/8] Downloading data …")
 
+    # Expose FRED key as env var so downstream code can also pick it up
+    if args.fred_key:
+        os.environ["FRED_API_KEY"] = args.fred_key
+
     equity_prices = download_equity_data(
         config.EQUITY_TICKERS, config.START_DATE, config.END_DATE
     )
@@ -160,7 +174,10 @@ def step_data(args: argparse.Namespace) -> pd.DataFrame:
         config.SECTOR_ETFS, config.START_DATE, config.END_DATE
     )
     ff_factors = download_ff_factors(config.START_DATE, config.END_DATE)
-    macro_df   = download_fred_data(config.START_DATE, config.END_DATE)
+    macro_df   = download_fred_data(
+        config.START_DATE, config.END_DATE,
+        api_key=args.fred_key or os.environ.get("FRED_API_KEY"),
+    )
 
     panel = build_panel(
         equity_prices,

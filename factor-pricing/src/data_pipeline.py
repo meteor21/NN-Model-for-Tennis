@@ -153,12 +153,22 @@ def download_ff_factors(start: str, end: str, url: str = None) -> pd.DataFrame:
 # FRED macro data
 # ─────────────────────────────────────────────────────────────────────────────
 
-def download_fred_data(start: str, end: str, series: dict = None) -> pd.DataFrame:
+def download_fred_data(
+    start: str,
+    end: str,
+    series: dict = None,
+    api_key: str = None,
+) -> pd.DataFrame:
     """
-    Fetch macro series from FRED via pandas_datareader.
+    Fetch macro series from FRED.
 
     Downloads VIX (VIXCLS), 10-year Treasury yield (DGS10), and the
     Moody's BAA–10Y credit spread (BAA10YM) by default.
+
+    Uses the FRED REST API directly when an *api_key* is provided (or the
+    ``FRED_API_KEY`` environment variable is set), which avoids the broken
+    ``pandas_datareader`` installation on some systems.  Falls back to
+    ``pandas_datareader`` otherwise.
 
     Parameters
     ----------
@@ -168,25 +178,59 @@ def download_fred_data(start: str, end: str, series: dict = None) -> pd.DataFram
         End date in 'YYYY-MM-DD' format.
     series : dict, optional
         Mapping of friendly name → FRED series ID. Defaults to config.FRED_SERIES.
+    api_key : str, optional
+        FRED API key.  If ``None``, reads ``FRED_API_KEY`` env variable.
 
     Returns
     -------
     pd.DataFrame
         DatetimeIndex DataFrame with one column per macro series.
     """
+    import os
     from config import FRED_SERIES
     target_series = series or FRED_SERIES
+
+    # Resolve API key: argument > env var
+    key = api_key or os.environ.get("FRED_API_KEY", "")
     logger.info("Downloading FRED series: %s …", list(target_series.keys()))
 
     frames = {}
-    for name, sid in target_series.items():
-        try:
-            s = web.DataReader(sid, "fred", start=start, end=end)
-            s.columns = [name]
-            frames[name] = s[name]
-            logger.info("  %s (%s): %d obs", name, sid, s[name].notna().sum())
-        except Exception as exc:
-            logger.warning("  Failed to download %s (%s): %s", name, sid, exc)
+
+    if key:
+        # ── Direct FRED REST API (no pandas_datareader needed) ────────────────
+        base = "https://api.stlouisfed.org/fred/series/observations"
+        for name, sid in target_series.items():
+            try:
+                params = {
+                    "series_id":        sid,
+                    "observation_start": start,
+                    "observation_end":   end,
+                    "api_key":           key,
+                    "file_type":        "json",
+                }
+                resp = requests.get(base, params=params, timeout=30)
+                resp.raise_for_status()
+                obs  = resp.json()["observations"]
+                s    = pd.Series(
+                    {o["date"]: float(o["value"]) if o["value"] != "." else float("nan")
+                     for o in obs},
+                    name=name,
+                )
+                s.index = pd.to_datetime(s.index)
+                frames[name] = s
+                logger.info("  %s (%s): %d obs via FRED API", name, sid, s.notna().sum())
+            except Exception as exc:
+                logger.warning("  FRED API failed for %s (%s): %s", name, sid, exc)
+    else:
+        # ── pandas_datareader fallback ────────────────────────────────────────
+        for name, sid in target_series.items():
+            try:
+                s = web.DataReader(sid, "fred", start=start, end=end)
+                s.columns = [name]
+                frames[name] = s[name]
+                logger.info("  %s (%s): %d obs via datareader", name, sid, s[name].notna().sum())
+            except Exception as exc:
+                logger.warning("  Failed to download %s (%s): %s", name, sid, exc)
 
     if not frames:
         raise RuntimeError("Could not download any FRED series.")

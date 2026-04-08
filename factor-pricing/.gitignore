@@ -1,5 +1,14 @@
+# API keys / secrets — never commit these
+.env
+*.env
+secrets.py
+
+# Generated data and results
+data/
+results/
+
+# Python cache
 __pycache__/
 *.pyc
 *.pyo
 .ipynb_checkpoints/
-.env
