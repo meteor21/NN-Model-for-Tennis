@@ -419,3 +419,244 @@ class KalmanFactorModel:
             sig_s[t] = sig_f[t] + G * (sig_s[t + 1] - sig_p[t + 1]) * G
 
         return mu_s
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multivariate Dynamic Factor Model (Kalman DFM)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MultivariateDFM:
+    """
+    Multivariate Dynamic Factor Model via Kalman filter + EM.
+
+    Models the joint dynamics of K latent factors:
+
+        F_t  = A F_{t-1} + η_t ,   η_t ~ N(0, Q)      [transition]
+        y_t  = F_t + ε_t       ,   ε_t ~ N(0, R)      [observation]
+
+    where A is a K×K transition matrix, Q is the K×K process noise
+    covariance, and R = diag(r_1, …, r_K) is diagonal observation noise.
+
+    Parameters estimated via the EM algorithm.
+
+    Parameters
+    ----------
+    n_iter : int
+        Number of EM iterations.
+    """
+
+    def __init__(self, n_iter: int = 20):
+        self.n_iter   = n_iter
+        self.A_: Optional[np.ndarray] = None   # K × K transition
+        self.Q_: Optional[np.ndarray] = None   # K × K process noise
+        self.R_: Optional[np.ndarray] = None   # K × K obs noise (diagonal)
+        self._smoothed: Optional[pd.DataFrame] = None
+        self._factor_names: list = []
+
+    # ------------------------------------------------------------------
+    def fit(self, factor_returns: pd.DataFrame) -> "MultivariateDFM":
+        """
+        Estimate model parameters on observed factor returns.
+
+        Parameters
+        ----------
+        factor_returns : pd.DataFrame
+            Factor return time series (T × K).
+
+        Returns
+        -------
+        self
+        """
+        clean = factor_returns.dropna()
+        self._factor_names = list(clean.columns)
+        Y = clean.values.T.astype(float)       # K × T
+        K, T = Y.shape
+
+        # ── Initialise ──────────────────────────────────────────────────
+        A = np.eye(K) * 0.5
+        Q = np.cov(Y) * 0.1 + np.eye(K) * 1e-4
+        R = np.diag(np.var(Y, axis=1) * 0.5 + 1e-4)
+        mu0  = Y[:, 0].copy()
+        P0   = np.eye(K)
+
+        logger.info("MultivariateDFM: fitting K=%d factors, T=%d, n_iter=%d", K, T, self.n_iter)
+
+        for iteration in range(self.n_iter):
+            # ── E-step: Kalman filter + RTS smoother ──────────────────
+            mu_f, P_f, mu_p, P_p = self._kalman_filter(Y, A, Q, R, mu0, P0)
+            mu_s, P_s, P_lag     = self._rts_smoother(mu_f, P_f, mu_p, P_p, A)
+
+            # Abort if numerics blew up
+            if not np.isfinite(mu_s).all():
+                logger.warning("MultivariateDFM: NaN in smoother at iter %d; stopping early.", iteration)
+                break
+
+            # ── M-step: update A, Q, R ────────────────────────────────
+            # A = (sum_{t=1}^{T-1} E[F_t F_{t-1}']) (sum E[F_{t-1} F_{t-1}'])^{-1}
+            S11 = np.zeros((K, K))   # sum E[F_t F_t']   t=1..T-1
+            S10 = np.zeros((K, K))   # sum E[F_t F_{t-1}']
+            S00 = np.zeros((K, K))   # sum E[F_{t-1} F_{t-1}']
+
+            for t in range(1, T):
+                S11 += P_s[:, :, t]     + np.outer(mu_s[:, t],     mu_s[:, t])
+                S10 += P_lag[:, :, t-1] + np.outer(mu_s[:, t],     mu_s[:, t-1])
+                S00 += P_s[:, :, t-1]   + np.outer(mu_s[:, t-1],   mu_s[:, t-1])
+
+            # Ridge-regularise S00 for stability
+            S00 += np.eye(K) * (np.trace(S00) / K) * 1e-4
+
+            A_new = S10 @ np.linalg.solve(S00, np.eye(K))
+
+            # Enforce stationarity: scale down A if spectral radius >= 1
+            eigs = np.abs(np.linalg.eigvals(A_new))
+            if eigs.max() >= 1.0:
+                A_new *= 0.95 / eigs.max()
+
+            # Q = (S11 - A S10') / (T-1)
+            Q_new = (S11 - A_new @ S10.T) / (T - 1)
+            # Symmetrise and ensure PSD via eigenvalue floor
+            Q_new = (Q_new + Q_new.T) / 2
+            eigvals_q, eigvecs_q = np.linalg.eigh(Q_new)
+            Q_new = eigvecs_q @ np.diag(np.maximum(eigvals_q, 1e-6)) @ eigvecs_q.T
+
+            # R = diag mean squared residual  (diagonal constraint)
+            resid2 = np.zeros(K)
+            for t in range(T):
+                e = Y[:, t] - mu_s[:, t]
+                resid2 += e ** 2 + np.diag(P_s[:, :, t])
+            R_new = np.diag(np.maximum(resid2 / T, 1e-6))
+
+            # Reject update if NaN appeared
+            if not (np.isfinite(A_new).all() and np.isfinite(Q_new).all() and np.isfinite(R_new).all()):
+                logger.warning("MultivariateDFM: NaN in M-step at iter %d; keeping previous params.", iteration)
+                break
+
+            # Update initial state
+            mu0 = mu_s[:, 0].copy()
+            P0  = P_s[:, :, 0].copy()
+
+            A, Q, R = A_new, Q_new, R_new
+
+        self.A_ = A
+        self.Q_ = Q
+        self.R_ = R
+        self._mu0 = mu0
+        self._P0  = P0
+        self._factor_returns = factor_returns.copy()
+
+        logger.info("MultivariateDFM fitted. A eigenvalues: %s",
+                    np.round(np.abs(np.linalg.eigvals(A)), 3))
+        return self
+
+    # ------------------------------------------------------------------
+    def smooth(self) -> pd.DataFrame:
+        """
+        Return Kalman-smoothed factor estimates.
+
+        Returns
+        -------
+        pd.DataFrame
+            Smoothed factors with same DatetimeIndex as input to ``fit()``.
+        """
+        if self.A_ is None:
+            raise RuntimeError("Call fit() before smooth().")
+        clean = self._factor_returns.dropna()
+        Y     = clean.values.T.astype(float)
+
+        mu_f, P_f, mu_p, P_p = self._kalman_filter(
+            Y, self.A_, self.Q_, self.R_, self._mu0, self._P0
+        )
+        mu_s, _, _ = self._rts_smoother(mu_f, P_f, mu_p, P_p, self.A_)
+
+        self._smoothed = pd.DataFrame(
+            mu_s.T, index=clean.index, columns=self._factor_names
+        )
+        return self._smoothed
+
+    def impulse_response(self, shock_factor: int = 0, horizon: int = 20) -> pd.DataFrame:
+        """
+        Compute impulse-response functions to a one-standard-deviation shock.
+
+        Parameters
+        ----------
+        shock_factor : int
+            Index of the factor receiving the shock.
+        horizon : int
+            Number of periods to trace the response.
+
+        Returns
+        -------
+        pd.DataFrame
+            IRF matrix (horizon × K).
+        """
+        if self.A_ is None:
+            raise RuntimeError("Call fit() first.")
+        K    = self.A_.shape[0]
+        irf  = np.zeros((horizon, K))
+        shock = np.zeros(K)
+        shock[shock_factor] = np.sqrt(self.Q_[shock_factor, shock_factor])
+
+        state = shock.copy()
+        for h in range(horizon):
+            irf[h] = state
+            state  = self.A_ @ state
+
+        cols = self._factor_names if self._factor_names else [f"F{i+1}" for i in range(K)]
+        return pd.DataFrame(irf, columns=cols,
+                            index=pd.RangeIndex(horizon, name="horizon"))
+
+    # ------------------------------------------------------------------
+    # Internal Kalman helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _kalman_filter(Y, A, Q, R, mu0, P0):
+        K, T = Y.shape
+        mu_f = np.zeros((K, T))
+        P_f  = np.zeros((K, K, T))
+        mu_p = np.zeros((K, T))
+        P_p  = np.zeros((K, K, T))
+
+        mu_p[:, 0] = A @ mu0
+        P_p[:, :, 0] = A @ P0 @ A.T + Q
+
+        for t in range(T):
+            if t > 0:
+                mu_p[:, t]   = A @ mu_f[:, t-1]
+                P_p[:, :, t] = A @ P_f[:, :, t-1] @ A.T + Q
+
+            S = P_p[:, :, t] + R
+            try:
+                K_gain = P_p[:, :, t] @ np.linalg.inv(S)
+            except np.linalg.LinAlgError:
+                K_gain = P_p[:, :, t] @ np.linalg.pinv(S)
+
+            innov       = Y[:, t] - mu_p[:, t]
+            mu_f[:, t]  = mu_p[:, t] + K_gain @ innov
+            P_f[:, :, t] = (np.eye(K) - K_gain) @ P_p[:, :, t]
+            P_f[:, :, t] = (P_f[:, :, t] + P_f[:, :, t].T) / 2
+
+        return mu_f, P_f, mu_p, P_p
+
+    @staticmethod
+    def _rts_smoother(mu_f, P_f, mu_p, P_p, A):
+        K, T = mu_f.shape
+        mu_s  = np.zeros((K, T))
+        P_s   = np.zeros((K, K, T))
+        P_lag = np.zeros((K, K, T - 1))   # Cov(F_t, F_{t-1} | Y)
+
+        mu_s[:, -1]    = mu_f[:, -1]
+        P_s[:, :, -1]  = P_f[:, :, -1]
+
+        for t in range(T - 2, -1, -1):
+            try:
+                G = P_f[:, :, t] @ np.linalg.inv(P_p[:, :, t+1]) @ A.T
+            except np.linalg.LinAlgError:
+                G = P_f[:, :, t] @ np.linalg.pinv(P_p[:, :, t+1]) @ A.T
+
+            mu_s[:, t]   = mu_f[:, t] + G @ (mu_s[:, t+1] - mu_p[:, t+1])
+            P_s[:, :, t] = P_f[:, :, t] + G @ (P_s[:, :, t+1] - P_p[:, :, t+1]) @ G.T
+            P_s[:, :, t] = (P_s[:, :, t] + P_s[:, :, t].T) / 2
+            P_lag[:, :, t] = G @ P_s[:, :, t+1]
+
+        return mu_s, P_s, P_lag

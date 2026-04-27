@@ -124,16 +124,21 @@ def factor_mimicking_portfolio(
         X = R.values
         valid = np.isfinite(y) & np.isfinite(X).all(axis=1)
         if valid.sum() < 20:
-            weights_dict[col] = pd.Series(np.zeros(R.shape[1]), index=R.columns)
+            weights_dict[col] = pd.Series(np.ones(R.shape[1]) / R.shape[1], index=R.columns)
             continue
 
         reg = LinearRegression(fit_intercept=False)
         reg.fit(X[valid], y[valid])
         w = pd.Series(reg.coef_, index=R.columns)
-        # Normalise
-        denom = w.abs().sum()
-        if denom > 1e-10:
-            w /= denom
+
+        # Long-only: keep only positive loadings, then normalise to sum = 1
+        w = w.clip(lower=0)
+        total = w.sum()
+        if total < 1e-10:
+            # All negative — fall back to equal weight
+            w = pd.Series(np.ones(R.shape[1]) / R.shape[1], index=R.columns)
+        else:
+            w /= total
         weights_dict[col] = w
 
     return pd.DataFrame(weights_dict)

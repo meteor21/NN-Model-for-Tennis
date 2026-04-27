@@ -7,7 +7,7 @@ Diebold-Mariano tests, and rolling R² plots.
 
 import logging
 import os
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import matplotlib
 matplotlib.use("Agg")
@@ -275,3 +275,127 @@ def plot_rolling_r2(
     fig.savefig(os.path.join(results_dir, filename), dpi=150, bbox_inches="tight")
     plt.close(fig)
     logger.info("Rolling R² plot saved: %s", os.path.join(results_dir, filename))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multiple-testing corrections
+# ─────────────────────────────────────────────────────────────────────────────
+
+def multiple_testing_correction(
+    p_values: Dict[str, float],
+    alpha: float = 0.05,
+) -> pd.DataFrame:
+    """
+    Apply Bonferroni and Benjamini-Hochberg corrections to a set of p-values.
+
+    Parameters
+    ----------
+    p_values : dict
+        Mapping of test name → raw p-value.
+    alpha : float
+        Familywise error rate / FDR level.
+
+    Returns
+    -------
+    pd.DataFrame
+        Table with raw p-value, Bonferroni-adjusted, BH-adjusted, and
+        rejection decision under each procedure.
+    """
+    names = list(p_values.keys())
+    pv    = np.array([p_values[n] for n in names])
+    m     = len(pv)
+
+    # Bonferroni
+    pv_bonf  = np.minimum(pv * m, 1.0)
+    rej_bonf = pv_bonf < alpha
+
+    # Benjamini-Hochberg (BH)
+    order    = np.argsort(pv)
+    pv_bh    = np.empty(m)
+    for i, idx in enumerate(order):
+        pv_bh[idx] = min(pv[idx] * m / (i + 1), 1.0)
+    # Enforce monotonicity from right
+    for i in range(m - 2, -1, -1):
+        pv_bh[order[i]] = min(pv_bh[order[i]], pv_bh[order[i + 1]])
+    rej_bh = pv_bh < alpha
+
+    table = pd.DataFrame({
+        "p_raw":       np.round(pv,      4),
+        "p_bonf":      np.round(pv_bonf, 4),
+        "reject_bonf": rej_bonf,
+        "p_bh":        np.round(pv_bh,   4),
+        "reject_bh":   rej_bh,
+    }, index=names)
+
+    print(f"\n── Multiple-Testing Corrections (α = {alpha}) ─────────────────")
+    print(table.to_string())
+    print(f"  Bonferroni rejections : {rej_bonf.sum()} / {m}")
+    print(f"  BH rejections         : {rej_bh.sum()} / {m}")
+    return table
+
+
+def model_confidence_set(
+    loss_matrix: pd.DataFrame,
+    alpha: float = 0.10,
+    n_bootstrap: int = 1000,
+    random_state: int = 42,
+) -> List[str]:
+    """
+    Simplified Model Confidence Set (Hansen et al. 2011).
+
+    Iteratively eliminates the worst model using a bootstrap test until
+    no model can be eliminated at level *alpha*.
+
+    Parameters
+    ----------
+    loss_matrix : pd.DataFrame
+        T × M matrix of per-period squared forecast errors.
+        Rows = time periods, columns = model names.
+    alpha : float
+        Significance level for elimination.
+    n_bootstrap : int
+        Bootstrap replications.
+    random_state : int
+        RNG seed.
+
+    Returns
+    -------
+    list of str
+        Names of models in the MCS (surviving models).
+    """
+    rng     = np.random.default_rng(random_state)
+    losses  = loss_matrix.dropna().copy()
+    models  = list(losses.columns)
+    T       = len(losses)
+
+    surviving = models.copy()
+
+    while len(surviving) > 1:
+        L = losses[surviving].values   # T × k
+        k = L.shape[1]
+
+        # Loss differentials relative to mean
+        d_bar = L.mean(axis=0) - L.mean()
+
+        # Bootstrap distribution of max |d_bar|
+        boot_max = []
+        for _ in range(n_bootstrap):
+            idx     = rng.integers(0, T, size=T)
+            L_b     = L[idx]
+            d_b     = L_b.mean(axis=0) - L_b.mean()
+            boot_max.append(np.max(np.abs(d_b - d_bar)))
+
+        thresh  = np.quantile(boot_max, 1 - alpha)
+        t_stats = np.abs(d_bar)
+
+        worst_idx = int(np.argmax(t_stats))
+        if t_stats[worst_idx] > thresh:
+            eliminated = surviving.pop(worst_idx)
+            logger.info("MCS eliminated: %s (t_stat=%.4f > %.4f)", eliminated,
+                        t_stats[worst_idx], thresh)
+        else:
+            break   # no model can be eliminated
+
+    logger.info("MCS survivors (%d): %s", len(surviving), surviving)
+    print(f"\n── Model Confidence Set (α={alpha}): {surviving}")
+    return surviving

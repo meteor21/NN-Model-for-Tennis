@@ -31,17 +31,19 @@ logger = logging.getLogger(__name__)
 
 class ForecastingModel:
     """
-    Unified wrapper around OLS / Ridge / Lasso / Elastic Net forecasters.
+    Unified wrapper around OLS / Ridge / Lasso / Elastic Net / XGBoost / LightGBM forecasters.
 
-    All penalised models perform time-series cross-validated alpha selection.
+    All penalised linear models perform time-series cross-validated alpha selection.
+    Tree-based models use early stopping on a held-out validation fold.
 
     Parameters
     ----------
     model_type : str
-        One of ``'ols'``, ``'ridge'``, ``'lasso'``, ``'elastic_net'``.
+        One of ``'ols'``, ``'ridge'``, ``'lasso'``, ``'elastic_net'``,
+        ``'xgboost'``, ``'lightgbm'``.
     """
 
-    _VALID_TYPES = {"ols", "ridge", "lasso", "elastic_net"}
+    _VALID_TYPES = {"ols", "ridge", "lasso", "elastic_net", "xgboost", "lightgbm"}
 
     def __init__(self, model_type: str = "ridge"):
         if model_type not in self._VALID_TYPES:
@@ -111,6 +113,41 @@ class ForecastingModel:
             )
             self._model.fit(X_scaled, y)
             self._best_alpha = float(self._model.alpha_)
+
+        elif self.model_type == "xgboost":
+            try:
+                from xgboost import XGBRegressor
+            except ImportError:
+                raise ImportError("xgboost not installed. Run: pip install xgboost")
+            # Time-series split: use last fold as validation for early stopping
+            split_idx = int(len(y) * 0.8)
+            X_tr, X_val = X_scaled[:split_idx], X_scaled[split_idx:]
+            y_tr, y_val = y[:split_idx], y[split_idx:]
+            self._model = XGBRegressor(
+                n_estimators=500, learning_rate=0.05, max_depth=4,
+                subsample=0.8, colsample_bytree=0.8, random_state=42,
+                early_stopping_rounds=20, eval_metric="rmse", verbosity=0,
+            )
+            self._model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+
+        elif self.model_type == "lightgbm":
+            try:
+                from lightgbm import LGBMRegressor
+            except ImportError:
+                raise ImportError("lightgbm not installed. Run: pip install lightgbm")
+            split_idx = int(len(y) * 0.8)
+            X_tr, X_val = X_scaled[:split_idx], X_scaled[split_idx:]
+            y_tr, y_val = y[:split_idx], y[split_idx:]
+            self._model = LGBMRegressor(
+                n_estimators=500, learning_rate=0.05, max_depth=4,
+                subsample=0.8, colsample_bytree=0.8, random_state=42,
+                early_stopping_rounds=20, verbose=-1,
+            )
+            self._model.fit(
+                X_tr, y_tr,
+                eval_set=[(X_val, y_val)],
+                callbacks=[],
+            )
 
         self._is_fitted = True
         alpha_str = f", α={self._best_alpha:.4g}" if self._best_alpha else ""
@@ -295,7 +332,16 @@ def run_forecasting_experiment(
         X_val,   y_val   = X_all[n_train:n_train+n_val], y_all[n_train:n_train+n_val]
         X_test,  y_test  = X_all[n_train+n_val:],       y_all[n_train+n_val:]
 
-        for model_type in ("ols", "ridge", "lasso"):
+        # Determine which model types to run (skip tree models if not installed)
+        model_types = ["ols", "ridge", "lasso"]
+        for pkg, mt in [("xgboost", "xgboost"), ("lightgbm", "lightgbm")]:
+            try:
+                __import__(pkg)
+                model_types.append(mt)
+            except ImportError:
+                logger.info("  %s not installed, skipping.", mt)
+
+        for model_type in model_types:
             model_name = f"{model_type}_{feature_label}"
             try:
                 fm = ForecastingModel(model_type=model_type)
